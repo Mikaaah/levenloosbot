@@ -1,0 +1,39 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backups / lokale bestanden
+*-bot -f
+*.save
+*_old.py
+activityrank_import.json
+
+# Lokale / private bestanden
+*.json
+*.save
+*_old.py
+./-bot -f
