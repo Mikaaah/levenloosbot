@@ -473,6 +473,8 @@ class ReactRoles(
                 WHERE guild_id = ?
                 AND section = ?
                 ORDER BY
+                    CASE WHEN min_level <= 1 THEN 0 ELSE 1 END ASC,
+                    min_level ASC,
                     button_name COLLATE NOCASE ASC,
                     sort_order ASC
                 """,
@@ -881,7 +883,8 @@ class ReactRoles(
                 f"{emoji} **{title.upper()}**\n"
                 f"└ {description}\n"
                 "└ Groen = je hebt deze rol.\n"
-                + ("└ 🔒 = je level is nog te laag.\n" if section in {"color", "roles"} else "")
+                + ("└ 🔒 = nog niet vrijgespeeld.\n" if section in {"color", "roles"} else "")
+                + ("└ Kleuren worden vrijgespeeld op level 100, 125, 150, 175 en 200.\n" if section == "color" else "")
                 + ("└ Je kunt maar één kleur tegelijk kiezen.\n" if section == "color" else "")
                 + "└ Klik opnieuw om hem te verwijderen."
             )

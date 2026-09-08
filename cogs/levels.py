@@ -29,6 +29,8 @@ LEVEL_BADGE = (
     "<:le5:1546518249997475880>"
 )
 LEVEL_UP_ICON = "<:lvl:1546517601167999127>"
+BRAND_COLOR = discord.Color.from_str("#6C27DA")
+PROGRESS_BAR_LENGTH = 12
 
 DEFAULTS = {
     "xp_text_enabled": "1",
@@ -53,6 +55,12 @@ DEFAULTS = {
     "xp_game_suggestion": "75",
     "xp_game_success_enabled": "1",
     "xp_game_success": "500",
+    "xp_suggestion_enabled": "1",
+    "xp_suggestion": "100",
+    "xp_suggestion_vote_enabled": "1",
+    "xp_suggestion_vote": "50",
+    "xp_suggestion_success_enabled": "1",
+    "xp_suggestion_success": "200",
     "levelup_enabled": "0",
     "levelup_channel_id": "0",
     "level_roles_enabled": "0",
@@ -69,6 +77,9 @@ SOURCE_LABELS = {
     "game_vote": "Game vote",
     "game_suggestion": "Game suggestie",
     "game_success": "Succesvolle game",
+    "suggestion": "Suggestie plaatsen",
+    "suggestion_vote": "Suggestie stemmen",
+    "suggestion_success": "Succesvolle suggestie",
     "manual": "Handmatige wijziging",
     "legacy_import": "ActivityRank import",
 }
@@ -84,6 +95,9 @@ XP_KEYS = {
     "game_vote": ("xp_game_vote_enabled", "xp_game_vote"),
     "game_suggestion": ("xp_game_suggestion_enabled", "xp_game_suggestion"),
     "game_success": ("xp_game_success_enabled", "xp_game_success"),
+    "suggestion": ("xp_suggestion_enabled", "xp_suggestion"),
+    "suggestion_vote": ("xp_suggestion_vote_enabled", "xp_suggestion_vote"),
+    "suggestion_success": ("xp_suggestion_success_enabled", "xp_suggestion_success"),
 }
 
 
@@ -111,6 +125,17 @@ def fmt_num(value: int) -> str:
 
 def fmt_hours(seconds: int) -> str:
     return f"{seconds / 3600:.1f}".replace(".", ",")
+
+
+def progress_bar(total_xp: int, level: int) -> tuple[str, int, int, int]:
+    current_floor = xp_for_level(level)
+    next_floor = xp_for_level(level + 1)
+    span = max(1, next_floor - current_floor)
+    progress = max(0, min(span, total_xp - current_floor))
+    percent = int((progress / span) * 100)
+    filled = round((progress / span) * PROGRESS_BAR_LENGTH)
+    bar = "█" * filled + "░" * (PROGRESS_BAR_LENGTH - filled)
+    return bar, percent, progress, span
 
 
 def is_admin(member: discord.Member) -> bool:
@@ -980,6 +1005,48 @@ class Levels(commands.Cog):
         if used_inviter and not used_inviter.bot:
             await self.award_source(member.guild, used_inviter.id, "invite", f"invite_join:{member.id}", member.id)
 
+    @commands.Cog.listener()
+    async def on_suggestion_created(
+        self,
+        guild: discord.Guild,
+        author_id: int,
+        suggestion_id: int,
+    ):
+        await self.award_source(
+            guild,
+            author_id,
+            "suggestion",
+            f"suggestion:{suggestion_id}:created",
+        )
+
+    @commands.Cog.listener()
+    async def on_suggestion_vote(
+        self,
+        guild: discord.Guild,
+        voter_id: int,
+        suggestion_id: int,
+    ):
+        await self.award_source(
+            guild,
+            voter_id,
+            "suggestion_vote",
+            f"suggestion:{suggestion_id}:vote:{voter_id}",
+        )
+
+    @commands.Cog.listener()
+    async def on_suggestion_accepted(
+        self,
+        guild: discord.Guild,
+        author_id: int,
+        suggestion_id: int,
+    ):
+        await self.award_source(
+            guild,
+            author_id,
+            "suggestion_success",
+            f"suggestion:{suggestion_id}:success",
+        )
+
     async def seed_default_roles(self, guild: discord.Guild):
         defaults = [(10, "Verslaafd", 0), (25, "Slaaploos", 0), (50, "Levenloos", 1), (100, "Needs Help", 1)]
         async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -1121,21 +1188,79 @@ class Levels(commands.Cog):
                 return index
         return 0
 
-    async def render_profile(self, member: discord.Member):
+    async def get_xp_source_totals(self, guild_id: int, user_id: int) -> dict[str, int]:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute(
+                """
+                SELECT source, COALESCE(SUM(xp), 0)
+                FROM levels_xp_log
+                WHERE guild_id = ? AND user_id = ?
+                GROUP BY source
+                """,
+                (guild_id, user_id),
+            )
+            return {source: int(total) for source, total in await cursor.fetchall()}
+
+    async def render_profile(self, member: discord.Member) -> discord.Embed:
         total, messages, voice = await self.get_user(member.guild.id, member.id)
         level = level_from_xp(total)
+        rank = await self.rank_for_user(member.guild.id, member.id)
         next_xp = xp_for_level(level + 1)
         needed = max(0, next_xp - total)
-        rank = await self.rank_for_user(member.guild.id, member.id)
-        return (
-            f"# {LEVEL_BADGE}\n\n"
-            f"> **{member.display_name}**\n"
-            f"> └ <:lvl:1546517601167999127> Level **{level}** • Rank **#{rank}**\n"
-            f"> └ ✨ **{fmt_num(total)} XP** • {fmt_num(needed)} XP tot level {level + 1}\n\n"
-            f"> **ACTIVITEIT**\n"
-            f"> └ 💬 {fmt_num(messages)} berichten\n"
-            f"> └ 🔊 {fmt_hours(voice)} uur voice"
+        bar, percent, progress, span = progress_bar(total, level)
+        source_totals = await self.get_xp_source_totals(member.guild.id, member.id)
+
+        embed = discord.Embed(
+            title=f"{LEVEL_UP_ICON} Level {level} • {member.display_name}",
+            color=BRAND_COLOR,
         )
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+        embed.add_field(
+            name="📊 Progressie",
+            value=(
+                f"`{bar}` **{percent}%**\n"
+                f"**{fmt_num(progress)} / {fmt_num(span)} XP** in dit level\n"
+                f"✨ **{fmt_num(total)} XP totaal** • 🏆 Rank **#{rank}**\n"
+                f"Nog **{fmt_num(needed)} XP** tot level **{level + 1}**"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="🎮 Activiteit",
+            value=(
+                f"💬 **{fmt_num(messages)}** berichten\n"
+                f"🔊 **{fmt_hours(voice)} uur** voice"
+            ),
+            inline=True,
+        )
+
+        special_sources = [
+            ("wave", "👋 Zwaaien"),
+            ("reaction", "❤️ Reacties"),
+            ("invite", "📨 Invites"),
+            ("congrats", "🎉 Feliciteren"),
+            ("birthday", "🎂 Verjaardag"),
+            ("game_vote", "🎮 Game votes"),
+            ("game_suggestion", "🕹️ Game suggesties"),
+            ("game_success", "🏆 Succesvolle games"),
+            ("suggestion", "💡 Suggesties"),
+            ("suggestion_vote", "🗳️ Suggestiestemmen"),
+            ("suggestion_success", "✅ Succesvolle suggesties"),
+        ]
+        source_lines = [
+            f"{label}: **{fmt_num(source_totals.get(source, 0))} XP**"
+            for source, label in special_sources
+        ]
+
+        embed.add_field(
+            name="✨ Extra XP",
+            value="\n".join(source_lines),
+            inline=True,
+        )
+        embed.set_footer(text="LEVENLOOS • Levels")
+        return embed
 
     async def leaderboard_rows(self, guild_id, sort_key):
         order = {"xp": "total_xp", "messages": "text_messages", "voice": "voice_seconds"}.get(sort_key, "total_xp")
@@ -1199,7 +1324,7 @@ class Levels(commands.Cog):
 
         embed = discord.Embed(
             description=f"# {LEADERBOARD_BADGE}\n\n> " + "\n> ".join(lines),
-            color=discord.Color.from_str("#6C27DA"),
+            color=BRAND_COLOR,
         )
         embed.set_footer(text=f"Pagina {page + 1}/{pages} • {len(rows)} spelers")
         return embed, pages
@@ -1259,15 +1384,49 @@ class Levels(commands.Cog):
             await db.commit()
         return f"✅ **ACTIVITYRANK IMPORT VOLTOOID**\n\nGeïmporteerd: **{len(matched)}** leden\nOvergeslagen: **{len(unmatched)}**\nOnduidelijk: **{len(duplicates)}**\n\nHistorische XP is opgeslagen in `levels.db`."
 
-    @app_commands.command(name="level", description="Bekijk je level of dat van iemand anders.")
-    async def level_cmd(self, interaction: discord.Interaction, member: Optional[discord.Member] = None):
-        if not interaction.guild:
+    async def send_profile(
+        self,
+        interaction: discord.Interaction,
+        member: Optional[discord.Member] = None,
+    ):
+        if interaction.guild is None:
             return
-        member = member or interaction.user
-        if not isinstance(member, discord.Member) or member.bot:
-            await interaction.response.send_message("❌ Bots nemen niet deel aan het levelsysteem.", ephemeral=True)
+
+        target = member or interaction.user
+        if not isinstance(target, discord.Member) or target.bot:
+            await interaction.response.send_message(
+                "❌ Bots nemen niet deel aan het levelsysteem.",
+                ephemeral=True,
+            )
             return
-        await interaction.response.send_message(await self.render_profile(member))
+
+        embed = await self.render_profile(target)
+        await interaction.response.send_message(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(
+        name="level",
+        description="Bekijk je level, XP en activiteit.",
+    )
+    async def level_cmd(
+        self,
+        interaction: discord.Interaction,
+        member: Optional[discord.Member] = None,
+    ):
+        await self.send_profile(interaction, member)
+
+    @app_commands.command(
+        name="xp",
+        description="Bekijk je XP, level en activiteit.",
+    )
+    async def xp_cmd(
+        self,
+        interaction: discord.Interaction,
+        member: Optional[discord.Member] = None,
+    ):
+        await self.send_profile(interaction, member)
 
     @app_commands.command(name="top", description="Bekijk het LEVENLOOS leaderboard.")
     async def top_cmd(self, interaction: discord.Interaction):
@@ -1303,6 +1462,103 @@ class Levels(commands.Cog):
         if not interaction.guild:
             return
         await interaction.response.send_message(await self.render_status(interaction.guild.id), ephemeral=True)
+
+    @levels.command(name="herbereken-xp", description="Herbereken alle XP uit berichten en voice-tijd.")
+    @app_commands.describe(
+        bevestigen="Moet True zijn om de herberekening uit te voeren.",
+    )
+    async def recalculate_xp(self, interaction: discord.Interaction, bevestigen: bool = False):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+            await interaction.response.send_message("❌ Je hebt geen toestemming om dit te doen.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        text_rate = await self.get_int(guild.id, "xp_text")
+        voice_rate = await self.get_int(guild.id, "xp_voice_per_minute")
+        text_enabled = await self.get_bool(guild.id, "xp_text_enabled")
+        voice_enabled = await self.get_bool(guild.id, "xp_voice_enabled")
+
+        if not bevestigen:
+            await interaction.response.send_message(
+                "⚠️ **XP HERBEREKENEN**\n\n"
+                "Dit vervangt de huidige `total_xp` van alle leden door een nieuwe berekening op basis van de opgeslagen activiteit:\n\n"
+                f"💬 berichten × **{text_rate} XP** {'✅' if text_enabled else '❌ uitgeschakeld'}\n"
+                f"🔊 volledige voice-minuten × **{voice_rate} XP** {'✅' if voice_enabled else '❌ uitgeschakeld'}\n\n"
+                "Andere XP-bronnen zoals waves, invites, reactions, suggesties, verjaardagen en handmatige XP tellen daarna **niet** meer mee in `total_xp`. "
+                "De opgeslagen aantallen berichten en voice-tijd blijven gewoon behouden.\n\n"
+                "Voer `/levels herbereken-xp bevestigen:True` uit om door te gaan.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # Neem lopende voice-sessies eerst mee tot op dit moment.
+        await self.refresh_all_voice(guild.id)
+
+        now = int(time.time())
+        members = [member for member in guild.members if not member.bot]
+        member_ids = {member.id for member in members}
+
+        # Zorg dat ieder huidig niet-bot lid minimaal een levels_users-rij heeft.
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            for member in members:
+                await db.execute(
+                    "INSERT OR IGNORE INTO levels_users (guild_id,user_id,created_at,updated_at) VALUES (?,?,?,?)",
+                    (guild.id, member.id, now, now),
+                )
+            await db.commit()
+
+        changed = 0
+        total_before = 0
+        total_after = 0
+        role_changes = 0
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute(
+                "SELECT user_id,total_xp,text_messages,voice_seconds FROM levels_users WHERE guild_id=?",
+                (guild.id,),
+            )
+            rows = await cur.fetchall()
+
+            for user_id, old_xp, messages, voice_seconds in rows:
+                # Oude/vertrokken gebruikers blijven in de database staan, maar worden
+                # alleen herberekend wanneer ze nog lid van deze server zijn.
+                if user_id not in member_ids:
+                    continue
+
+                message_xp = int(messages) * text_rate if text_enabled else 0
+                voice_xp = (int(voice_seconds) // 60) * voice_rate if voice_enabled else 0
+                new_xp = max(0, message_xp + voice_xp)
+
+                total_before += int(old_xp)
+                total_after += new_xp
+                if new_xp != int(old_xp):
+                    changed += 1
+
+                await db.execute(
+                    "UPDATE levels_users SET total_xp=?,updated_at=? WHERE guild_id=? AND user_id=?",
+                    (new_xp, now, guild.id, user_id),
+                )
+
+            await db.commit()
+
+        # Synchroniseer bestaande levelrollen stilletjes met de nieuwe levels.
+        if await self.get_bool(guild.id, "level_roles_enabled"):
+            for member in members:
+                role_changes += await self.apply_level_roles(member)
+
+        await interaction.followup.send(
+            "✅ **XP HERBEREKEND**\n\n"
+            f"Leden verwerkt: **{len(members)}**\n"
+            f"XP gewijzigd bij: **{changed}** leden\n"
+            f"Totaal vóór: **{fmt_num(total_before)} XP**\n"
+            f"Totaal na: **{fmt_num(total_after)} XP**\n\n"
+            f"💬 Formule: berichten × **{text_rate} XP**\n"
+            f"🔊 Formule: volledige voice-minuten × **{voice_rate} XP**\n"
+            f"🏅 Levelrol-wijzigingen: **{role_changes}**",
+            ephemeral=True,
+        )
 
     @levels.command(name="import-preview", description="Controleer de ActivityRank import zonder iets te wijzigen.")
     async def import_preview(self, interaction: discord.Interaction):
