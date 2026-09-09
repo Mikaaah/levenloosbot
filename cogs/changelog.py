@@ -4,7 +4,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-ANNOUNCEMENT_CHANNEL_ID = 1546644553409495040
 DEFAULT_COLOR = 0x6C27DA
 
 
@@ -22,7 +21,7 @@ def parse_color(value: str) -> discord.Color:
 
 
 def build_embed(raw: str, color: discord.Color) -> discord.Embed:
-    """Simple paste format: first '# ' line = title, '## ' lines = fields."""
+    """Paste format: first '# ' line = title, '## ' lines = fields."""
     lines = raw.replace("\r\n", "\n").strip().split("\n")
     title = "Mededeling"
     description_lines: list[str] = []
@@ -64,9 +63,9 @@ def build_embed(raw: str, color: discord.Color) -> discord.Embed:
     return embed
 
 
-class AnnouncementModal(discord.ui.Modal, title="Nieuwe announcement"):
+class AnnouncementModal(discord.ui.Modal, title="Nieuwe embed"):
     content = discord.ui.TextInput(
-        label="Paste",
+        label="Inhoud",
         style=discord.TextStyle.paragraph,
         placeholder="# Titel\n\nTekst...\n\n## Onderdeel\nMeer tekst...",
         required=True,
@@ -81,36 +80,72 @@ class AnnouncementModal(discord.ui.Modal, title="Nieuwe announcement"):
         max_length=7,
     )
 
-    def __init__(self, cog: "Changelog", ping_role: discord.Role | None):
+    def __init__(
+        self,
+        cog: "Changelog",
+        channel: discord.TextChannel,
+        ping_role: discord.Role | None,
+    ):
         super().__init__()
         self.cog = cog
+        self.channel = channel
         self.ping_role = ping_role
 
-    async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message("❌ Dit werkt alleen in een server.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+            await interaction.response.send_message("❌ Je hebt geen toestemming om dit te doen.", ephemeral=True)
+            return
+
+        # Resolve the channel again so stale/deleted channels are handled cleanly.
+        channel = interaction.guild.get_channel(self.channel.id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Het gekozen kanaal bestaat niet meer.", ephemeral=True)
+            return
+
+        ping_role: discord.Role | None = None
+        if self.ping_role is not None:
+            ping_role = interaction.guild.get_role(self.ping_role.id)
+            if ping_role is None:
+                await interaction.response.send_message("❌ De gekozen pingrol bestaat niet meer.", ephemeral=True)
+                return
+            if ping_role.is_default() or ping_role.managed:
+                await interaction.response.send_message("❌ Deze rol kan niet als pingrol worden gebruikt.", ephemeral=True)
+                return
+
+        me = interaction.guild.me
+        if me is None:
+            await interaction.response.send_message("❌ Ik kan mijn serverrechten niet controleren.", ephemeral=True)
+            return
+
+        permissions = channel.permissions_for(me)
+        if not permissions.view_channel or not permissions.send_messages or not permissions.embed_links:
+            await interaction.response.send_message(
+                f"❌ Ik heb in {channel.mention} **Kanaal bekijken**, **Berichten verzenden** en **Links insluiten** nodig.",
+                ephemeral=True,
+            )
             return
 
         try:
             color = parse_color(str(self.color))
             embed = build_embed(str(self.content), color)
         except ValueError:
-            await interaction.response.send_message("❌ Gebruik een geldige hexkleur, bijvoorbeeld `#6C27DA`.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Gebruik een geldige hexkleur, bijvoorbeeld `#6C27DA`.",
+                ephemeral=True,
+            )
             return
 
-        channel = interaction.guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("❌ Het announcement-kanaal is niet gevonden.", ephemeral=True)
-            return
-
-        # Only the explicitly selected ping role may notify. Role mentions inside the embed never ping.
         allowed_mentions = discord.AllowedMentions(
             everyone=False,
             users=False,
-            roles=[self.ping_role] if self.ping_role else False,
+            roles=[ping_role] if ping_role else False,
             replied_user=False,
         )
-        message_content = self.ping_role.mention if self.ping_role else None
+        message_content = ping_role.mention if ping_role else None
 
         try:
             message = await channel.send(
@@ -119,40 +154,179 @@ class AnnouncementModal(discord.ui.Modal, title="Nieuwe announcement"):
                 allowed_mentions=allowed_mentions,
             )
         except discord.Forbidden:
-            await interaction.response.send_message("❌ Ik kan niet in het announcement-kanaal sturen.", ephemeral=True)
+            await interaction.response.send_message(
+                f"❌ Ik kan niet in {channel.mention} sturen.",
+                ephemeral=True,
+            )
             return
         except discord.HTTPException as exc:
             await interaction.response.send_message(f"❌ Versturen mislukt: `{exc}`", ephemeral=True)
             return
 
+        ping_text = ping_role.mention if ping_role else "geen ping"
         await interaction.response.send_message(
-            f"✅ Announcement geplaatst in {channel.mention}.\n{message.jump_url}",
+            f"✅ Embed geplaatst in {channel.mention} · {ping_text}\n{message.jump_url}",
             ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
+
+
+class ChannelPicker(discord.ui.ChannelSelect):
+    def __init__(self, parent: "EmbedBuilderView"):
+        super().__init__(
+            placeholder="1. Kies het kanaal…",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            row=0,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.parent_view.ensure_owner(interaction):
+            return
+
+        selected = self.values[0]
+        channel = interaction.guild.get_channel(selected.id) if interaction.guild else None
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Kies een normaal tekst- of announcementkanaal.", ephemeral=True)
+            return
+
+        self.parent_view.channel = channel
+        self.parent_view.update_components()
+        await interaction.response.edit_message(embed=self.parent_view.build_status_embed(), view=self.parent_view)
+
+
+class PingRolePicker(discord.ui.RoleSelect):
+    def __init__(self, parent: "EmbedBuilderView"):
+        super().__init__(
+            placeholder="2. Kies optioneel een pingrol…",
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.parent_view.ensure_owner(interaction):
+            return
+
+        role = self.values[0]
+        if role.is_default():
+            await interaction.response.send_message("❌ `@everyone` kan niet als pingrol worden gebruikt.", ephemeral=True)
+            return
+        if role.managed:
+            await interaction.response.send_message("❌ Deze beheerde rol kan niet als pingrol worden gebruikt.", ephemeral=True)
+            return
+
+        self.parent_view.ping_role = role
+        self.parent_view.update_components()
+        await interaction.response.edit_message(embed=self.parent_view.build_status_embed(), view=self.parent_view)
+
+
+class EmbedBuilderView(discord.ui.View):
+    def __init__(self, cog: "Changelog", author_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.author_id = author_id
+        self.channel: discord.TextChannel | None = None
+        self.ping_role: discord.Role | None = None
+
+        self.channel_picker = ChannelPicker(self)
+        self.role_picker = PingRolePicker(self)
+        self.add_item(self.channel_picker)
+        self.add_item(self.role_picker)
+        self.update_components()
+
+    async def ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Alleen degene die deze builder opende kan hem gebruiken.", ephemeral=True)
+            return False
+        return True
+
+    def update_components(self) -> None:
+        self.create_embed.disabled = self.channel is None
+        self.clear_ping.disabled = self.ping_role is None
+
+    def build_status_embed(self) -> discord.Embed:
+        channel_text = self.channel.mention if self.channel else "*Nog niet gekozen*"
+        ping_text = self.ping_role.mention if self.ping_role else "Geen ping"
+
+        embed = discord.Embed(
+            title="📝 Embed maken",
+            description=(
+                "Kies hieronder waar de embed geplaatst moet worden en eventueel welke rol gepingd wordt.\n"
+                "Daarna opent **Embed maken** het invoervenster."
+            ),
+            color=discord.Color(DEFAULT_COLOR),
+        )
+        embed.add_field(name="📍 Kanaal", value=channel_text, inline=True)
+        embed.add_field(name="🔔 Ping", value=ping_text, inline=True)
+        embed.set_footer(text="Deze builder verloopt na 5 minuten.")
+        return embed
+
+    @discord.ui.button(label="Geen ping", emoji="🔕", style=discord.ButtonStyle.secondary, row=2)
+    async def clear_ping(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self.ensure_owner(interaction):
+            return
+        self.ping_role = None
+        self.update_components()
+        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+
+    @discord.ui.button(label="Embed maken", emoji="✨", style=discord.ButtonStyle.primary, row=2)
+    async def create_embed(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self.ensure_owner(interaction):
+            return
+        if self.channel is None:
+            await interaction.response.send_message("❌ Kies eerst een kanaal.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(
+            AnnouncementModal(
+                cog=self.cog,
+                channel=self.channel,
+                ping_role=self.ping_role,
+            )
+        )
+
+    @discord.ui.button(label="Annuleren", emoji="✖️", style=discord.ButtonStyle.danger, row=2)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self.ensure_owner(interaction):
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Embed-builder geannuleerd.", embed=None, view=self)
+        self.stop()
 
 
 class Changelog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    changelog = app_commands.Group(name="changelog", description="LEVENLOOS announcements en changelogs.")
+    changelog = app_commands.Group(
+        name="changelog",
+        description="LEVENLOOS announcements en changelogs.",
+    )
 
-    @changelog.command(name="embed", description="Plaats een announcement-embed vanuit een paste.")
-    @app_commands.describe(ping="Optionele rol die boven de embed wordt gepingd.")
-    async def embed_command(self, interaction: discord.Interaction, ping: discord.Role | None = None):
+    async def open_builder(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
             await interaction.response.send_message("❌ Je hebt geen toestemming om dit te doen.", ephemeral=True)
             return
 
-        if ping is not None:
-            if ping.is_default():
-                await interaction.response.send_message("❌ `@everyone` kan niet als pingrol worden gebruikt.", ephemeral=True)
-                return
-            if ping.managed:
-                await interaction.response.send_message("❌ Deze rol kan niet als pingrol worden gebruikt.", ephemeral=True)
-                return
+        view = EmbedBuilderView(self, interaction.user.id)
+        await interaction.response.send_message(
+            embed=view.build_status_embed(),
+            view=view,
+            ephemeral=True,
+        )
 
-        await interaction.response.send_modal(AnnouncementModal(self, ping))
+    @app_commands.command(name="embed", description="Maak interactief een embed en kies kanaal en pingrol.")
+    async def embed(self, interaction: discord.Interaction) -> None:
+        await self.open_builder(interaction)
+
+    @changelog.command(name="embed", description="Maak interactief een embed en kies kanaal en pingrol.")
+    async def changelog_embed(self, interaction: discord.Interaction) -> None:
+        await self.open_builder(interaction)
 
 
 async def setup(bot: commands.Bot):
